@@ -98,6 +98,9 @@ label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 3px
   background: #fff;
 }
 .badge.prec { border-color: var(--accent); color: var(--accent-dark); }
+.badge.ok { border-color: var(--ok); color: var(--ok); background: var(--ok-bg); }
+.badge.danger-badge { border-color: var(--danger); color: var(--danger); background: var(--danger-bg); }
+.badge.muted-badge { color: var(--muted); }
 
 .muted { color: var(--muted); font-size: 13px; }
 .source {

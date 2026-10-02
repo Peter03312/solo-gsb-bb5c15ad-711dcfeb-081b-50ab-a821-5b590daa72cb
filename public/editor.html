@@ -42,6 +42,29 @@
     </div>
 
     <div class="card">
+      <h2>预约发布（定时公开）</h2>
+      <p class="muted">
+        草稿通过校验后，可指定一个<b>未来的 UTC 时刻</b>预约发布。创建时系统立即冻结
+        <b>事件、每个事件所选主张、「先于」关系、求解日期与当前最新版本号</b>；
+        时间非法或校验不通过则不会建立预约。到期前访客只见旧版，此后无论你怎样修改 / 恢复草稿，
+        预约内容都不再变化。到期时仅当冻结的基准版本号仍是当前最新版本号，才生成不可变新版本；
+        否则预约标记为<b>冲突</b>并保留冻结内容（不自动改基准，需取消后重新预约）。
+      </p>
+      <div class="row">
+        <div class="field" style="max-width:280px">
+          <label>预约发布时刻（UTC，如 2026-10-05T08:00:00Z）</label>
+          <input type="text" id="scheduleAt" placeholder="2026-10-05T08:00:00Z" />
+        </div>
+        <button id="btnSchedule" type="button">建立预约</button>
+        <button class="secondary" id="btnSchedulePlus1m" type="button">填入 1 分钟后</button>
+        <button class="secondary" id="btnSchedulePlus1h" type="button">填入 1 小时后</button>
+      </div>
+      <div id="scheduleMsg" style="margin-top:10px"></div>
+      <h3 style="margin-top:14px">预约列表</h3>
+      <div id="scheduleList" class="muted">加载中…</div>
+    </div>
+
+    <div class="card">
       <h2>导入采访整理包（JSON）</h2>
       <p class="muted">
         上传或粘贴整理包：含批次标识 <code>batchId</code>、以包内唯一键 <code>key</code> 标记的事件
@@ -164,6 +187,17 @@
     <div class="d-body" id="rawVersionBody">加载中…</div>
     <div class="d-foot">
       <button id="rawVersionClose" type="button" class="secondary">关闭</button>
+    </div>
+  </dialog>
+
+  <!-- 预约冻结内容对话框 -->
+  <dialog id="scheduleDialog">
+    <div class="d-head" style="background:var(--ok-bg);color:var(--ok);border-color:#bcd8c2">
+      预约 <span id="scheduleDialogNo"></span> 冻结内容（到期按此发布）
+    </div>
+    <div class="d-body" id="scheduleDialogBody">加载中…</div>
+    <div class="d-foot">
+      <button id="scheduleDialogClose" type="button" class="secondary">关闭</button>
     </div>
   </dialog>
 

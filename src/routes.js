@@ -12,6 +12,13 @@ const {
   applyRedactionToVersion,
   listRedactions,
 } = require('./redact');
+const {
+  createSchedule,
+  cancelSchedule,
+  listSchedules,
+  getScheduleById,
+  pendingScheduleCount,
+} = require('./schedules');
 
 const router = express.Router();
 
@@ -142,6 +149,7 @@ router.get('/api/editor/state', (req, res) => {
     currentVersionNo: latestVersionNo(),
     currentVersion: getVersionSummary(latestVersionNo()) || null,
     draftRevisionNo: draftRevisionNo(),
+    pendingScheduleCount: pendingScheduleCount(),
     events,
     relations,
   });
@@ -400,6 +408,47 @@ router.post('/api/editor/redaction', (req, res) => {
 // 已登记的出处遮盖清单（编辑者视角，含原文）
 router.get('/api/editor/redactions', (req, res) => {
   res.json({ currentVersionNo: latestVersionNo(), redactions: listRedactions() });
+});
+
+// ================= 预约发布（定时发布） =================
+// 创建时冻结事件、所选主张、先于关系、求解日期与当前最新版本号；
+// 时间非法 / 校验不通过（422，同即时发布 errors 结构）则不建立预约。
+
+// ---- 建立预约 ----
+// 体含 selection（同即时发布）、scheduledAt（未来 UTC ISO 时刻）、editor、note。
+// 预约内容在服务端冻结，请求不需也不接受 baseVersionNo（一律冻结服务端当前最新版本号）。
+router.post('/api/editor/schedules', (req, res) => {
+  const body = req.body || {};
+  if (body.baseVersionNo !== undefined) {
+    throw badRequest('预约发布的基准版本号由服务器在创建时自动冻结，请勿提交 baseVersionNo');
+  }
+  const selectionList = normalizeSelection(body);
+  const editor = optionalString(body, 'editor', 200) || '匿名编辑';
+  const note = optionalString(body, 'note', 1000);
+  const schedule = createSchedule({ selectionList, scheduledAt: body.scheduledAt, editor, note });
+  res.status(201).json({ ok: true, schedule });
+});
+
+// ---- 工作台：全部预约（含冻结内容），新预约在前 ----
+router.get('/api/editor/schedules', (req, res) => {
+  res.json({ currentVersionNo: latestVersionNo(), schedules: listSchedules() });
+});
+
+// ---- 单个预约（查看冻结的事件 / 主张 / 关系） ----
+router.get('/api/editor/schedules/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) throw badRequest('预约 id 必须是正整数');
+  const schedule = getScheduleById(id);
+  if (!schedule) throw { status: 404, message: `预约 ${req.params.id} 不存在` };
+  res.json({ schedule });
+});
+
+// ---- 取消尚未执行的预约；已生效 / 冲突 / 已取消返回 409 ----
+router.delete('/api/editor/schedules/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) throw badRequest('预约 id 必须是正整数');
+  const schedule = cancelSchedule(id);
+  res.json({ ok: true, schedule });
 });
 
 module.exports = router;

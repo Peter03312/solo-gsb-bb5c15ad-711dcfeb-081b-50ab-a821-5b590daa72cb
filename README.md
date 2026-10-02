@@ -52,6 +52,7 @@ npm test                      # 运行求解器与接口测试
 | `EDITOR_TOKEN` | `editor` | 编辑者口令，生产使用务必修改 |
 | `DB_PATH` | `./data/chronicle.db`（容器内 `/app/data/chronicle.db`） | SQLite 数据库文件路径，目录自动创建 |
 | `SEED_DEMO` | 未设置 | 设为 `1` 时启动写入演示草稿（仅在库为空时） |
+| `SCHEDULE_TICK_MS` | `1000` | 预约发布到期轮询间隔（毫秒）；启动时总会立即追赶一次停机期间到期的预约 |
 
 改端口示例：
 
@@ -229,6 +230,44 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 
    完整可运行的调用示例见 `examples/redaction-example.sh`（自动建草稿、发布两版、预览、确认、核对访客视图与原文视图）。
 
+### 预约发布（定时公开）
+
+编辑者可为**已通过现有发布校验**的草稿指定一个未来的 UTC 时刻预约发布。可在编辑台「预约发布」卡片操作，也可直接调用 HTTP API。
+
+**建立预约时立即冻结**：每个事件及其所选主张（精度、覆盖区间、出处、考异）、全部「先于」关系、求解出的具体日期，以及**当时的最新版本号**（基准版本号由服务器冻结，请求中不要提交 `baseVersionNo`）。
+
+- 时间必须是**带时区的完整 UTC 日期时间**（如 `2026-10-05T08:00:00Z`，也接受 `2026-10-05T16:00:00+08:00`），且严格晚于当前时刻；只给日期（`2026-10-05`）、非法格式、已过期时间均返回 **400**；
+- 草稿未通过校验（缺主张 / 选择失效 / 关系成环 / 时间无解）返回 **422**，错误结构与即时发布一致，**不建立预约**；
+- **到期前访客只见旧版**；预约建立后无论怎样修改、删除甚至清空草稿，或从历史版本恢复草稿，**预约冻结内容都不再变化**（恢复草稿只换草稿区，不动任何预约与历史快照）；
+- **到期按预约时间、预约号顺序**逐条尝试（默认每 1 秒轮询一次；服务器重启时会立即追赶停机期间到期的预约）：
+  - 冻结的基准版本号**仍等于**当前最新版本号 → 生成一个**不可变新版本**（与即时发布同一写入路径），预约标记为 `published`；
+  - 冻结基准号已落后（期间有即时发布或更早的预约先生效）→ 预约标记为 **`conflict`（冲突）**，**保留冻结内容**供编辑者查看，**不发布、不自动改基准**；需编辑者核对后取消并重新预约；
+- **重启或重复触发绝不重复发布**：状态迁移在事务内以 `pending` 为守卫条件，终态（`published` / `conflict` / `cancelled`）不重复执行；任何失败整体回滚，**不留下半版**（该预约下一轮继续重试）；
+- 编辑者可在工作台**查看全部预约及其冻结内容**、**取消尚未执行的预约**；**已生效（以及冲突、已取消）的预约不能取消**（返回 **409** `SCHEDULE_NOT_PENDING`）；预约记录不删除；
+- 预约到期生成的新版本，公开读取**继续应用出处遮盖**；即时发布、历史版本与原有接口全部保持兼容。
+
+调用示例：
+
+```bash
+TOKEN=editor
+BASE=http://localhost:3000
+# selection 与即时发布相同；scheduledAt 为未来 UTC 时刻（不要传 baseVersionNo）
+AT=$(node -e 'console.log(new Date(Date.now()+60000).toISOString())')  # 1 分钟后
+curl -s -X POST $BASE/api/editor/schedules \
+  -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"selection":[{"eventId":1,"claimId":1},{"eventId":2,"claimId":3}],
+       "scheduledAt":"'"$AT"'","editor":"志愿者小王","note":"十月初公开"}'
+# => 201 {"ok":true,"schedule":{"id":1,"scheduleNo":1,"status":"pending",
+#       "scheduledAt":"2026-10-02T…Z","baseVersionNo":1,
+#       "events":[…冻结的事件+被选主张+求解日期…],"relations":[…冻结的先于关系…]}}
+
+curl -s -H "X-Editor-Token: $TOKEN" $BASE/api/editor/schedules          # 工作台：全部预约
+curl -s -H "X-Editor-Token: $TOKEN" $BASE/api/editor/schedules/1        # 单个预约（冻结内容）
+curl -s -X DELETE -H "X-Editor-Token: $TOKEN" $BASE/api/editor/schedules/1   # 取消待执行预约
+```
+
+完整可运行示例见 `examples/schedule-example.sh`（建草稿、预约 2 秒后到期、核对到期前后访客视图、取消、抢跑冲突、400/409/422 参数分支）。
+
 ### 两名编辑者并发修改（版本冲突）
 
 发布请求必须带 `baseVersionNo`（编辑台打开时自动记录当前最新版本号）。若两名编辑者都从第 N 版开始改，第一人发布产生第 N+1 版后，第二人仍以 `baseVersionNo=N` 提交时：
@@ -250,6 +289,7 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 - 历史版本表 `versions / version_events / version_relations` 只追加、不更新不删除，保证不可变。
 - 导入批次表 `import_batches` 记录每次成功导入的批次标识与内容指纹，用于防止同一批次重复导入。
 - 出处遮盖表 `source_redactions` 同样只追加：只存被遮盖的精确出处文本，**不回写快照或草稿**；删除该表对应行即恢复公开显示。
+- 预约发布表 `scheduled_publishes / schedule_events / schedule_relations`：创建时冻结事件、所选主张、先于关系、求解日期与基准版本号；到期仅当基准仍为最新版本号才把冻结内容复制成不可变新版本，否则置 `conflict` 保留内容。预约行不删除（取消仅置 `cancelled`），状态迁移在事务内以 `pending` 为守卫，重启 / 重复触发不重复发布。
 
 ## 目录结构
 
@@ -264,10 +304,11 @@ src/
   restore.js    恢复草稿：只读预览 + 原子替换事务（修订号/版本号冲突检查、按快照重建）
   bundle.js     采访整理包导入：整包校验 + 内容指纹 + 只读预览 + 事务追加（批次防重/修订号冲突检查）
   redact.js     出处遮盖：精确出处文本的只读命中预览 + 只追加登记（版本号冲突检查）；公开读出层动态替换为「出处已遮盖」
+  schedules.js  预约发布：创建时校验并冻结快照/基准版本号；到期按时间、预约号顺序尝试（基准未变才生成新版本，否则置冲突保留内容）；查看/取消待执行预约；轮询定时器（启动即追赶，状态守卫防重复发布）
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-examples/       采访整理包 JSON 示例；出处遮盖 curl 调用示例
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖）
+examples/       采访整理包 JSON 示例；出处遮盖、预约发布 curl 调用示例
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布）
 ```
 
 ## 主要 HTTP API
@@ -304,3 +345,15 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
   - 409：`{code:"VERSION_CONFLICT", currentVersionNo, expectedVersionNo, ...}`（预览后发布了新版本，不落库）；空文本或版本号非法 400
 - `GET  /api/editor/redactions` — 已登记遮盖清单（编辑者视角，含出处原文与登记时间）
 - `GET  /api/editor/versions/:no/raw` — 指定版本快照**原文**（持编辑口令，不应用遮盖；恢复草稿亦用原文）
+
+预约发布（需请求头 `X-Editor-Token`；基准版本号由服务器在创建时冻结，请求体不含 `baseVersionNo`）：
+
+- `POST /api/editor/schedules` — 建立预约；体含 `selection`（同即时发布）、`scheduledAt`（未来 UTC 时刻，如 `2026-10-05T08:00:00Z`）、`editor`、`note`
+  - 201：`{ok:true, schedule:{id, scheduleNo, status:"pending", scheduledAt, baseVersionNo, editor, note, createdAt, executedAt:null, resultVersionNo:null, conflictVersionNo:null, events:[…冻结事件+被选主张+求解日期…], relations:[…冻结关系…]}}`
+  - 400：时间非法 / 只给日期 / 已过期 / 误传 `baseVersionNo`
+  - 422：`{errors:[…]}`（与即时发布相同的缺主张 / 成环 / 时间无解错误，不建立预约）
+- `GET  /api/editor/schedules` — 工作台全部预约（新预约在前，含各状态与冻结内容）
+- `GET  /api/editor/schedules/:id` — 单个预约（查看冻结的事件、主张、求解日期、关系）；不存在 404
+- `DELETE /api/editor/schedules/:id` — 取消**尚未执行**的预约；已 `published` / `conflict` / `cancelled` 返回 409 `SCHEDULE_NOT_PENDING`（附 `scheduleStatus`），不存在 404
+- 到期执行结果体现在预约状态：`published`（`resultVersionNo` 为生成的新版本号、`executedAt` 为执行时刻）或 `conflict`（`baseVersionNo` 冻结基准、`conflictVersionNo` 到期时最新版本号，冻结内容保留）
+- 另：`GET /api/editor/state` 新增 `pendingScheduleCount`（待执行预约数）

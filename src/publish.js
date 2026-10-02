@@ -46,6 +46,102 @@ function evaluateDraft(selectionList) {
   return { ...result, events, claims, relations, selected };
 }
 
+// 由求解结果构造待写入快照的事件行 / 关系行（排序后）。
+// 即时发布与预约发布共用：预约时把这些行冻结进 schedule_*，到期再原样复制进版本快照。
+function buildSnapshotRows(evalResult) {
+  const { dates, events, selected, relations, claims } = evalResult;
+
+  // 年表按求解出的具体日排序；同日按标题，保持稳定
+  const sortedEvents = [...events].sort((a, b) => {
+    const da = dates.get(a.id);
+    const db2 = dates.get(b.id);
+    if (da !== db2) return da - db2;
+    return a.title.localeCompare(b.title, 'zh-Hans-CN');
+  });
+
+  const eventOrder = new Map();
+  const eventRows = sortedEvents.map((ev, i) => {
+    eventOrder.set(ev.id, i);
+    const sel = selected.get(ev.id);
+    const claimRow = claims.find((c) => c.id === sel.claimId);
+    return {
+      eventId: ev.id,
+      title: ev.title,
+      description: ev.description || '',
+      claimId: claimRow.id,
+      precision: claimRow.precision,
+      dateLabel: claimRow.date_label,
+      intervalStart: claimRow.interval_start,
+      intervalEnd: claimRow.interval_end,
+      resolvedDate: isoFromOrdinal(dates.get(ev.id)),
+      source: claimRow.source,
+      claimNote: claimRow.note,
+      sortOrder: i,
+    };
+  });
+
+  const relationRows = [...relations]
+    .sort(
+      (a, b) =>
+        eventOrder.get(a.earlierId) - eventOrder.get(b.earlierId) ||
+        eventOrder.get(a.laterId) - eventOrder.get(b.laterId)
+    )
+    .map((r, i) => ({
+      relationId: r.id,
+      earlierEventId: r.earlierId,
+      laterEventId: r.laterId,
+      source: r.source || '',
+      note: r.note || '',
+      sortOrder: i,
+    }));
+
+  return { eventRows, relationRows };
+}
+
+// 在给定外层事务 / 连接下，把一组快照行写入某 versionId 的版本快照表。
+// 行可来自即时求解结果（buildSnapshotRows），也可来自冻结的预约快照。
+function insertVersionSnapshot(db, versionId, rows) {
+  const insEvent = db.prepare(`
+    INSERT INTO version_events
+      (version_id, event_id, title, description, claim_id, precision, date_label,
+       interval_start, interval_end, resolved_date, source, claim_note, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const ev of rows.eventRows) {
+    insEvent.run(
+      versionId,
+      ev.eventId,
+      ev.title,
+      ev.description,
+      ev.claimId,
+      ev.precision,
+      ev.dateLabel,
+      ev.intervalStart,
+      ev.intervalEnd,
+      ev.resolvedDate,
+      ev.source,
+      ev.claimNote,
+      ev.sortOrder
+    );
+  }
+  const insRel = db.prepare(`
+    INSERT INTO version_relations
+      (version_id, relation_id, earlier_event_id, later_event_id, source, note, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const rel of rows.relationRows) {
+    insRel.run(
+      versionId,
+      rel.relationId,
+      rel.earlierEventId,
+      rel.laterEventId,
+      rel.source,
+      rel.note,
+      rel.sortOrder
+    );
+  }
+}
+
 // 发布一个新版本。selectionList: [{eventId, claimId}]
 // baseVersionNo: 编辑者发起修改时所基于的版本号；null/0 表示尚无版本。
 // 抛 { status, ...body } 表示 HTTP 错误。
@@ -56,8 +152,6 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
     throw { status: 400, message: '请为每个事件选择一条主张后再发布' };
   }
 
-  const currentRow = db.prepare('SELECT MAX(version_no) AS no FROM versions').get();
-  const currentNo = currentRow.no || 0;
   const base = Number(baseVersionNo || 0);
 
   const evalResult = evaluateDraft(selectionList);
@@ -68,11 +162,11 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
       errors: evalResult.errors,
     };
   }
+  const rows = buildSnapshotRows(evalResult);
 
   // 在事务内再次确认基准版本，避免并发下的静默覆盖
   const tx = db.transaction(() => {
-    const row = db.prepare('SELECT MAX(version_no) AS no FROM versions').get();
-    const latest = row.no || 0;
+    const latest = latestVersionNo();
     if (base !== latest) {
       throw {
         status: 409,
@@ -88,61 +182,7 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
     const verInfo = db
       .prepare('INSERT INTO versions (version_no, parent_no, editor, note) VALUES (?, ?, ?, ?)')
       .run(newNo, base, String(editor || ''), String(note || ''));
-    const versionId = verInfo.lastInsertRowid;
-
-    const { dates, events, selected, relations } = evalResult;
-
-    const insEvent = db.prepare(`
-      INSERT INTO version_events
-        (version_id, event_id, title, description, claim_id, precision, date_label,
-         interval_start, interval_end, resolved_date, source, claim_note, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    // 年表按求解出的具体日排序；同日按标题，保持稳定
-    const sorted = [...events].sort((a, b) => {
-      const da = dates.get(a.id);
-      const db2 = dates.get(b.id);
-      if (da !== db2) return da - db2;
-      return a.title.localeCompare(b.title, 'zh-Hans-CN');
-    });
-
-    const eventOrder = new Map();
-    sorted.forEach((ev, i) => {
-      eventOrder.set(ev.id, i);
-      const sel = selected.get(ev.id);
-      const claimRow = evalResult.claims.find((c) => c.id === sel.claimId);
-      insEvent.run(
-        versionId,
-        ev.id,
-        ev.title,
-        ev.description,
-        claimRow.id,
-        claimRow.precision,
-        claimRow.date_label,
-        claimRow.interval_start,
-        claimRow.interval_end,
-        isoFromOrdinal(dates.get(ev.id)),
-        claimRow.source,
-        claimRow.note,
-        i
-      );
-    });
-
-    const insRel = db.prepare(`
-      INSERT INTO version_relations
-        (version_id, relation_id, earlier_event_id, later_event_id, source, note, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    const sortedRels = [...relations].sort(
-      (a, b) =>
-        eventOrder.get(a.earlierId) - eventOrder.get(b.earlierId) ||
-        eventOrder.get(a.laterId) - eventOrder.get(b.laterId)
-    );
-    sortedRels.forEach((r, i) => {
-      insRel.run(versionId, r.id, r.earlierId, r.laterId, r.source || '', r.note || '', i);
-    });
-
+    insertVersionSnapshot(db, verInfo.lastInsertRowid, rows);
     return newNo;
   });
 
@@ -193,4 +233,12 @@ function getVersionDetail(no) {
   return { ...summary, events: listEvents, relations: listRels };
 }
 
-module.exports = { publishVersion, evaluateDraft, latestVersionNo, getVersionDetail, getVersionSummary };
+module.exports = {
+  publishVersion,
+  evaluateDraft,
+  buildSnapshotRows,
+  insertVersionSnapshot,
+  latestVersionNo,
+  getVersionDetail,
+  getVersionSummary,
+};

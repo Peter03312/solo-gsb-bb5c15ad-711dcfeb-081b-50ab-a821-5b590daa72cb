@@ -3,6 +3,7 @@
 const path = require('path');
 const express = require('express');
 const { getDb } = require('./db');
+const { startScheduler } = require('./schedules');
 const routes = require('./routes');
 
 const app = express();
@@ -48,6 +49,7 @@ app.use((err, req, res, next) => {
 
 function start() {
   getDb(); // 初始化数据库
+  startScheduler(); // 预约发布定时器（启动立即追赶一次停机期间到期的预约）
   const port = Number(process.env.PORT || 3000);
   const host = process.env.HOST || '0.0.0.0';
   const server = app.listen(port, host, () => {

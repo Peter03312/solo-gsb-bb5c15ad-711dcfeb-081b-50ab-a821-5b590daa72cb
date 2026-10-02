@@ -28,13 +28,14 @@ const store = {
   clearSelections() { localStorage.removeItem('selections'); },
 };
 
-let state = { events: [], relations: [], currentVersionNo: 0, draftRevisionNo: 0 };
+let state = { events: [], relations: [], currentVersionNo: 0, draftRevisionNo: 0, pendingScheduleCount: 0 };
 let baseVersionNo = 0; // 发起修改时所基于的版本号
 let conflictData = null;
 let restorePreview = null; // 恢复草稿预览（确认时提交其中的修订号/最新版本号）
 let bundleParsed = null;   // 解析后的整理包原包（确认时原样提交）
 let bundlePreview = null;  // 导入预览（确认时提交其中的指纹/草稿修订号）
 let redactPreview = null;  // 出处遮盖预览（确认时提交其中的最新版本号）
+let scheduleRefreshTimer = null; // 预约列表自动刷新（到期状态会自己变化）
 
 async function api(method, url, body) {
   const res = await fetch(url, {
@@ -191,6 +192,7 @@ async function loadState() {
   if (changed) localStorage.setItem('selections', JSON.stringify(m));
   render();
   loadVersions();
+  loadSchedules();
 }
 
 async function loadVersions() {
@@ -679,6 +681,151 @@ async function openRawVersion(versionNo) {
   }
 }
 
+// ---------- 预约发布（定时公开） ----------
+function showScheduleMsg(kind, html) {
+  $('#scheduleMsg').innerHTML = `<div class="alert ${kind}">${html}</div>`;
+}
+
+function pad(n) { return String(n).padStart(2, '0'); }
+
+// 返回若干秒后的 UTC ISO（秒级），用于快速填入
+function utcIsoIn(seconds) {
+  const d = new Date(Date.now() + seconds * 1000);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}` +
+    `T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}Z`;
+}
+
+const SCHEDULE_STATUS = {
+  pending: ['待执行', 'prec'],
+  published: ['已生效', 'ok'],
+  conflict: ['版本冲突', 'danger-badge'],
+  cancelled: ['已取消', 'muted-badge'],
+};
+
+async function loadSchedules() {
+  let data;
+  try {
+    data = await api('GET', '/api/editor/schedules');
+  } catch (err) {
+    if (err.message === 'unauthorized') return;
+    $('#scheduleList').textContent = `加载失败：${err.message}`;
+    return;
+  }
+  const list = data.schedules || [];
+  $('#scheduleList').innerHTML = list.length
+    ? list.map((s) => {
+        const [label, cls] = SCHEDULE_STATUS[s.status] || [s.status, ''];
+        const detail = s.status === 'published'
+          ? `<span class="muted">已生成第 ${s.resultVersionNo} 版 · ${esc((s.executedAt || '').replace('T', ' ').slice(0, 16))} UTC 执行</span>`
+          : s.status === 'conflict'
+            ? `<span class="muted">冻结基准为第 ${s.baseVersionNo} 版，到期时最新已是第 ${s.conflictVersionNo} 版；内容保留如下，未发布也未自动改基准。</span>`
+            : s.status === 'cancelled'
+              ? '<span class="muted">已取消，不会发布。</span>'
+              : `<span class="muted">冻结基准：第 ${s.baseVersionNo} 版 · 到期仅当最新仍为该版本才发布。</span>`;
+        const actions = s.status === 'pending'
+          ? `<button class="danger" type="button" data-cancel-schedule="${s.id}" style="padding:2px 10px;font-size:13px">取消预约</button>`
+          : '';
+        return `
+        <div class="rel-line">
+          <div class="row" style="align-items:center">
+            <strong>预约 #${s.scheduleNo}</strong>
+            <span class="badge ${cls}">${label}</span>
+            <span class="muted" style="flex:1">${esc(s.scheduledAt.replace('T', ' ').replace(/\.\d{3}Z$/, 'Z'))} · ${esc(s.editor || '匿名')} · ${s.events.length} 个事件</span>
+            <button class="linkbtn" type="button" data-view-schedule="${s.id}">查看冻结内容</button>
+            ${actions}
+          </div>
+          ${s.note ? `<div class="muted">${esc(s.note)}</div>` : ''}
+          <div>${detail}</div>
+        </div>`;
+      }).join('')
+    : '<p class="muted">尚无预约。</p>';
+}
+
+async function createSchedule() {
+  const err = clientCheck();
+  if (err) { showScheduleMsg('error', esc(err)); return; }
+  const scheduledAt = $('#scheduleAt').value.trim();
+  if (!scheduledAt) { showScheduleMsg('error', '请填写未来的 UTC 预约时刻，例如 2026-10-05T08:00:00Z。'); return; }
+  const btn = $('#btnSchedule');
+  btn.disabled = true;
+  try {
+    const data = await api('POST', '/api/editor/schedules', {
+      selection: gatherSelection(),
+      scheduledAt,
+      editor: store.editor || '匿名编辑',
+      note: $('#publishNote').value,
+    });
+    const s = data.schedule;
+    showScheduleMsg('ok', `
+      已建立 <b>预约 #${s.scheduleNo}</b>：${esc(s.scheduledAt)} UTC 到期尝试发布。
+      已冻结 ${s.events.length} 个事件的所选主张、先后关系、求解日期与基准第 ${s.baseVersionNo} 版。
+      到期前访客只见旧版；之后修改草稿不影响本预约。`);
+    $('#scheduleAt').value = '';
+    await loadState();
+  } catch (e) {
+    if (e.status === 422 && e.body?.errors) {
+      // 复用求解错误渲染（定位到事件卡片）
+      renderSolverErrors(e.body.errors);
+      showScheduleMsg('error', '草稿未通过发布校验，未建立预约，详见上方「发布」区的错误列表。');
+    } else {
+      showScheduleMsg('error', esc(e.message));
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function cancelSchedule(id) {
+  if (!confirm('取消这个尚未执行的预约？取消后不会到期发布。')) return;
+  try {
+    await api('DELETE', `/api/editor/schedules/${id}`);
+    await loadSchedules();
+    showScheduleMsg('ok', '预约已取消（记录保留，不会到期发布）。');
+  } catch (err) {
+    if (err.message === 'unauthorized') return;
+    showScheduleMsg('error', esc(err.message));
+  }
+}
+
+function scheduleContentHtml(s) {
+  const titleById = new Map(s.events.map((e) => [e.eventId, e.title]));
+  const evs = s.events.map((e) => `
+    <div class="rel-line">
+      <strong>${esc(e.title)}</strong>
+      <span class="badge prec">${esc(e.dateLabel)}</span>
+      <span class="badge">求解日期 ${esc(e.resolvedDate)}</span>
+      <span class="badge">区间 ${e.intervalStart} ~ ${e.intervalEnd}</span>
+      <div class="source"><b>出处：</b>${esc(e.source || '（未注明）')}</div>
+      ${e.claimNote ? `<div class="muted">${esc(e.claimNote)}</div>` : ''}
+    </div>`).join('');
+  const rels = s.relations.length
+    ? s.relations.map((r) => `
+        <div class="rel-line">
+          <strong>${esc(titleById.get(r.earlierEventId) || '#' + r.earlierEventId)}</strong>
+          <span class="badge">先于</span>
+          <strong>${esc(titleById.get(r.laterEventId) || '#' + r.laterEventId)}</strong>
+          ${r.source ? `<div class="source"><b>出处：</b>${esc(r.source)}</div>` : ''}
+        </div>`).join('')
+    : '<p class="muted">（无先于关系）</p>';
+  return `
+    <p>预约时刻 <b>${esc(s.scheduledAt)}</b> UTC · 冻结基准 <b>第 ${s.baseVersionNo} 版</b> · ${s.events.length} 个事件。</p>
+    <h3 style="font-size:13px">事件与被选主张（含求解日期）</h3>${evs}
+    <h3 style="font-size:13px;margin-top:10px">「先于」关系</h3>${rels}`;
+}
+
+async function viewSchedule(id) {
+  $('#scheduleDialogNo').textContent = '#' + id;
+  $('#scheduleDialogBody').textContent = '加载中…';
+  $('#scheduleDialog').showModal();
+  try {
+    const data = await api('GET', `/api/editor/schedules/${id}`);
+    $('#scheduleDialogBody').innerHTML = scheduleContentHtml(data.schedule);
+  } catch (err) {
+    if (err.message === 'unauthorized') { $('#scheduleDialog').close(); return; }
+    $('#scheduleDialogBody').innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+  }
+}
+
 // ---------- 事件委托：增删改 ----------
 async function onClick(e) {
   const t = e.target;
@@ -692,6 +839,15 @@ async function onClick(e) {
   }
   if (t.id === 'btnValidate') return doValidate();
   if (t.id === 'btnPublish') return doPublish();
+
+  if (t.id === 'btnSchedule') return createSchedule();
+  if (t.id === 'btnSchedulePlus1m') { $('#scheduleAt').value = utcIsoIn(60); return; }
+  if (t.id === 'btnSchedulePlus1h') { $('#scheduleAt').value = utcIsoIn(3600); return; }
+  if (t.id === 'scheduleDialogClose') { $('#scheduleDialog').close(); return; }
+  const viewScheduleId = t.dataset && t.dataset.viewSchedule;
+  if (viewScheduleId !== undefined) return viewSchedule(Number(viewScheduleId));
+  const cancelScheduleId = t.dataset && t.dataset.cancelSchedule;
+  if (cancelScheduleId !== undefined) return cancelSchedule(Number(cancelScheduleId));
 
   if (t.id === 'conflictCancel') { $('#conflictDialog').close(); return; }
   if (t.id === 'conflictReload') {
@@ -829,6 +985,11 @@ $('#bundleFile').addEventListener('change', async (e) => {
 });
 
 (async function init() {
+  // 预约状态随到期自动变化，工作台每 10 秒静默刷新一次预约列表与版本号
+  scheduleRefreshTimer = setInterval(() => {
+    if (store.token) loadSchedules().catch(() => {});
+  }, 10000);
+
   if (!store.token) {
     showGlobal('warn', '请先在右上角输入编辑者口令（默认 <code>editor</code>，可用环境变量 EDITOR_TOKEN 修改），然后点“保存口令”。');
     return;

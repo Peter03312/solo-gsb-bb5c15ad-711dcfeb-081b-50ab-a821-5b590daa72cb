@@ -140,6 +140,60 @@ CREATE TABLE IF NOT EXISTS source_redactions (
   editor      TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ============ 预约发布（定时发布） ============
+-- 预约创建时把事件、所选主张、先于关系、求解日期与当时最新版本号整体冻结进
+-- schedule_events / schedule_relations（结构与版本快照一致）。到期时只比较
+-- base_version_no 与当前最新版本号：相等则把冻结内容复制成不可变新版本，
+-- 不等则标记 conflict 保留内容供编辑者查看，绝不自动改基准。
+-- pending → published | conflict | cancelled 为终态迁移（仅允许一次），
+-- 行本身不删除，重启 / 重复触发靠 status 判定保证不重复发布。
+CREATE TABLE IF NOT EXISTS scheduled_publishes (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_no         INTEGER NOT NULL UNIQUE,   -- 预约号（只增，不复用）
+  scheduled_at        TEXT NOT NULL,             -- 预约发布时刻，UTC ISO（如 2026-10-05T08:00:00.000Z）
+  status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','published','conflict','cancelled')),
+  base_version_no     INTEGER NOT NULL,          -- 创建时冻结的基准（当前最新）版本号
+  editor              TEXT NOT NULL DEFAULT '',
+  note                TEXT NOT NULL DEFAULT '',
+  created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  executed_at         TEXT,                      -- 实际尝试时刻 UTC
+  result_version_no   INTEGER,                   -- status=published 时生成的新版本号
+  conflict_version_no INTEGER                    -- status=conflict 时的当前最新版本号
+);
+CREATE INDEX IF NOT EXISTS idx_sched_due
+  ON scheduled_publishes(status, scheduled_at, schedule_no);
+
+CREATE TABLE IF NOT EXISTS schedule_events (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id       INTEGER NOT NULL REFERENCES scheduled_publishes(id) ON DELETE CASCADE,
+  event_id          INTEGER NOT NULL,
+  title             TEXT NOT NULL,
+  description       TEXT NOT NULL DEFAULT '',
+  claim_id          INTEGER NOT NULL,
+  precision         TEXT NOT NULL,
+  date_label        TEXT NOT NULL,
+  interval_start    TEXT NOT NULL,
+  interval_end      TEXT NOT NULL,
+  resolved_date     TEXT NOT NULL,               -- 冻结的求解具体日 ISO
+  source            TEXT NOT NULL DEFAULT '',
+  claim_note        TEXT NOT NULL DEFAULT '',
+  sort_order        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_se_schedule ON schedule_events(schedule_id);
+
+CREATE TABLE IF NOT EXISTS schedule_relations (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id      INTEGER NOT NULL REFERENCES scheduled_publishes(id) ON DELETE CASCADE,
+  relation_id      INTEGER NOT NULL,
+  earlier_event_id INTEGER NOT NULL,
+  later_event_id   INTEGER NOT NULL,
+  source           TEXT NOT NULL DEFAULT '',
+  note             TEXT NOT NULL DEFAULT '',
+  sort_order       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sr_schedule ON schedule_relations(schedule_id);
 `;
 
 let db;
@@ -151,6 +205,8 @@ function getDb() {
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // 多进程（如多实例 / 到期事务撞车）时短暂等待写锁，而非立即抛 SQLITE_BUSY
+  db.pragma('busy_timeout = 5000');
   db.exec(SCHEMA);
   return db;
 }
