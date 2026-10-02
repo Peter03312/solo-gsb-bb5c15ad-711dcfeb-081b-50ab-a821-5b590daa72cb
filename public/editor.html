@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>年表编辑台 · 地方口述史</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>年表编辑台</h1>
+    <span class="sub" id="versionTag">—</span>
+    <span class="spacer"></span>
+    <input type="password" id="tokenInput" placeholder="编辑者口令" style="width:150px" />
+    <button class="secondary" id="tokenSave" type="button">保存口令</button>
+    <a class="muted" href="/">← 返回访客年表</a>
+  </header>
+
+  <main class="container">
+    <div id="globalMsg"></div>
+
+    <div class="card">
+      <h2>发布</h2>
+      <p class="muted">
+        为<b>每个</b>事件选定一条主张（允许彼此矛盾的主张并存，但发布只能各选一条）。
+        粗精度日期按覆盖区间计算；只有全部事件都能在区间内取到满足严格先后关系的具体日期，才会生成不可变新版本。
+        校验失败或版本冲突时，上一版本保持不变。
+      </p>
+      <div class="row">
+        <div class="field" style="max-width:220px">
+          <label>编辑者署名</label>
+          <input type="text" id="editorName" placeholder="如：志愿者小王" />
+        </div>
+        <div class="field" style="max-width:320px">
+          <label>版本说明（可选）</label>
+          <input type="text" id="publishNote" placeholder="如：补入修水渠相关事件" />
+        </div>
+        <button id="btnValidate" type="button" class="secondary">校验能否发布</button>
+        <button id="btnPublish" type="button">发布新版本</button>
+      </div>
+      <div id="publishResult" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>导入采访整理包（JSON）</h2>
+      <p class="muted">
+        上传或粘贴整理包：含批次标识 <code>batchId</code>、以包内唯一键 <code>key</code> 标记的事件
+        （每事件多条含出处的时间主张），以及按键引用事件的「先于」关系。
+        先<b>只读预览</b>待写入内容与数量；键重复、关系引用缺失、日期或出处非法会列出全部问题并整包拒绝。
+        确认须提交原包、预览返回的内容指纹与草稿修订号；内容被替换、草稿已变化或批次曾成功导入都会冲突且不写入。
+        导入只<b>追加</b>到草稿区（既有草稿、历史快照与访客年表不受影响），仍需选定主张、校验后发布才会公开。
+      </p>
+      <div class="row">
+        <div class="field" style="max-width:280px">
+          <label>选择 JSON 文件</label>
+          <input type="file" id="bundleFile" accept=".json,application/json" />
+        </div>
+      </div>
+      <label style="margin-top:8px">或直接粘贴整理包 JSON</label>
+      <textarea id="bundleText" rows="5" placeholder='{"batchId":"2026-09-fangtan-01","events":[{"key":"a","title":"…","claims":[{"precision":"year","year":1958,"source":"…"}]}],"relations":[]}'></textarea>
+      <div style="margin-top:8px"><button id="btnBundlePreview" type="button" class="secondary">预览导入内容（只读）</button></div>
+      <div id="bundleMsg" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>按出处原文撤回公开展示（出处遮盖）</h2>
+      <p class="muted">
+        输入<b>非空的精确出处文本</b>（与快照中的出处逐字相同才命中），先<b>只读预览</b>它在
+        <b>全部已发布版本</b>的事件主张与「先于」关系中命中的位置与数量，再携预览时的最新版本号确认。
+        确认后<b>不改写历史快照或草稿</b>：访客读取最新年表或任一历史版本时，命中位置的出处统一显示
+        <b>「出处已遮盖」</b>，其余字段与版本号不变；以后发布含同一文本的版本也自动遮盖。
+        持口令在版本详情与恢复草稿中仍可查看、使用原文。预览后若已发布新版本，确认会报冲突且不落库。
+      </p>
+      <label>精确出处原文</label>
+      <textarea id="redactSource" rows="2" placeholder="如：李宝山口述，2021-07-05 访谈，录音 03 段 08:12"></textarea>
+      <div style="margin-top:8px"><button id="btnRedactPreview" type="button" class="secondary">预览命中位置（只读）</button></div>
+      <div id="redactMsg" style="margin-top:10px"></div>
+    </div>
+
+    <div class="grid2">
+      <section>
+        <div class="card">
+          <h2>事件与时间主张</h2>
+          <div id="eventList"></div>
+
+          <h3 style="margin-top:18px">新增事件</h3>
+          <div class="row">
+            <div class="field"><label>事件标题</label><input type="text" id="newEventTitle" placeholder="如：老桥落成" /></div>
+          </div>
+          <label style="margin-top:8px">事件描述（可选）</label>
+          <textarea id="newEventDesc"></textarea>
+          <div style="margin-top:8px"><button id="btnAddEvent" type="button">添加事件</button></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="card">
+          <h2>「先于」关系</h2>
+          <p class="muted">声明 A 严格先于 B（两个事件不能是同一天）。</p>
+          <div id="relList"></div>
+          <h3 style="margin-top:14px">新增关系</h3>
+          <div class="row">
+            <div class="field"><label>较早事件</label><select id="relEarlier"></select></div>
+            <div style="padding-bottom:6px">先于</div>
+            <div class="field"><label>较晚事件</label><select id="relLater"></select></div>
+          </div>
+          <label style="margin-top:8px">出处（可选）</label>
+          <input type="text" id="relSource" />
+          <div style="margin-top:8px"><button id="btnAddRel" type="button">添加关系</button></div>
+        </div>
+
+        <div class="card">
+          <h2>已发布版本</h2>
+          <p class="muted">历史快照不可变。可从任一已发布版本<b>预览并恢复草稿</b>：原子替换当前草稿（只带回该版被选主张），历史快照与访客年表不受影响；恢复后仍需校验、发布才会公开。</p>
+          <div id="versionList" class="muted">加载中…</div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- 版本冲突对话框 -->
+  <dialog id="conflictDialog">
+    <div class="d-head">⚠ 版本冲突：已有更新的发布版本</div>
+    <div class="d-body" id="conflictBody"></div>
+    <div class="d-foot">
+      <button class="secondary" id="conflictCancel" type="button">取消，稍后处理</button>
+      <button id="conflictReload" type="button">刷新到最新版本并重新确认选择</button>
+    </div>
+  </dialog>
+
+  <!-- 从历史版本恢复草稿对话框 -->
+  <dialog id="restoreDialog">
+    <div class="d-head" style="background:var(--warn-bg)">↩ 预览并从已发布版本恢复草稿</div>
+    <div class="d-body" id="restoreBody">加载预览中…</div>
+    <div class="d-foot">
+      <button class="secondary" id="restoreCancel" type="button">取消</button>
+      <button id="restoreConfirm" type="button">确认：用该版替换当前草稿</button>
+    </div>
+  </dialog>
+
+  <!-- 导入采访整理包对话框 -->
+  <dialog id="bundleDialog">
+    <div class="d-head" style="background:var(--ok-bg);color:var(--ok);border-color:#bcd8c2">⇪ 预览导入采访整理包</div>
+    <div class="d-body" id="bundleBody">加载预览中…</div>
+    <div class="d-foot">
+      <button class="secondary" id="bundleCancel" type="button">取消</button>
+      <button id="bundleConfirm" type="button">确认导入整包</button>
+    </div>
+  </dialog>
+
+  <!-- 出处遮盖确认对话框 -->
+  <dialog id="redactDialog">
+    <div class="d-head" style="background:#fbeaea;color:#a33;border-color:#e0b8b8">▣ 预览出处遮盖（撤回公开展示）</div>
+    <div class="d-body" id="redactBody">加载预览中…</div>
+    <div class="d-foot">
+      <button class="secondary" id="redactCancel" type="button">取消</button>
+      <button id="redactConfirm" type="button">确认遮盖：访客视图统一显示「出处已遮盖」</button>
+    </div>
+  </dialog>
+
+  <!-- 版本原文对话框（持口令，不遮盖） -->
+  <dialog id="rawVersionDialog">
+    <div class="d-head">第 <span id="rawVersionNo"></span> 版快照原文（编辑者可见，访客看到的是遮盖视图）</div>
+    <div class="d-body" id="rawVersionBody">加载中…</div>
+    <div class="d-foot">
+      <button id="rawVersionClose" type="button" class="secondary">关闭</button>
+    </div>
+  </dialog>
+
+  <script src="/editor.js"></script>
+</body>
+</html>

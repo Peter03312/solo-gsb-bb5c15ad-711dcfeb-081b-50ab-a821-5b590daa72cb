@@ -1,0 +1,405 @@
+'use strict';
+
+const express = require('express');
+const { getDb } = require('./db');
+const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
+const { evaluateDraft, publishVersion, latestVersionNo, getVersionDetail, getVersionSummary } = require('./publish');
+const { buildRestorePreview, restoreDraftFromVersion, draftRevisionNo } = require('./restore');
+const { buildImportPreview, confirmImport } = require('./bundle');
+const {
+  previewSourceRedaction,
+  confirmSourceRedaction,
+  applyRedactionToVersion,
+  listRedactions,
+} = require('./redact');
+
+const router = express.Router();
+
+// ---------- 辅助 ----------
+function badRequest(message) {
+  return { status: 400, message };
+}
+
+function requireString(body, field, { max = 500, allowEmpty = false } = {}) {
+  const v = body[field];
+  if (typeof v !== 'string') throw badRequest(`字段 ${field} 必须是字符串`);
+  if (!allowEmpty && v.trim() === '') throw badRequest(`字段 ${field} 不能为空`);
+  if (v.length > max) throw badRequest(`字段 ${field} 长度不能超过 ${max}`);
+  return v;
+}
+
+function optionalString(body, field, max = 2000) {
+  const v = body[field];
+  if (v == null) return '';
+  if (typeof v !== 'string') throw badRequest(`字段 ${field} 必须是字符串`);
+  if (v.length > max) throw badRequest(`字段 ${field} 长度不能超过 ${max}`);
+  return v;
+}
+
+// 事件不存在 → 404
+function getEventOr404(id) {
+  const ev = getDb().prepare('SELECT * FROM events WHERE id = ?').get(id);
+  if (!ev) throw { status: 404, message: `事件 ${id} 不存在` };
+  return ev;
+}
+
+function claimRowToApi(c) {
+  return {
+    id: c.id,
+    eventId: c.event_id,
+    precision: c.precision,
+    year: c.year,
+    month: c.month,
+    day: c.day,
+    dateLabel: c.date_label,
+    intervalStart: c.interval_start,
+    intervalEnd: c.interval_end,
+    source: c.source,
+    note: c.note,
+  };
+}
+
+function eventRowToApi(e) {
+  const claims = getDb()
+    .prepare('SELECT * FROM claims WHERE event_id = ? ORDER BY id')
+    .all(e.id)
+    .map(claimRowToApi);
+  return {
+    id: e.id,
+    title: e.title,
+    description: e.description,
+    claims,
+  };
+}
+
+function readClaimPayload(body) {
+  const { precision, year, month, day } = parseClaimDate(body || {});
+  const source = requireString(body, 'source', { max: 1000 });
+  const note = optionalString(body, 'note', 2000);
+  const { start, end } = claimInterval(precision, year, month, day);
+  return {
+    precision,
+    year,
+    month,
+    day,
+    dateLabel: formatClaimDate(precision, year, month, day),
+    intervalStart: start,
+    intervalEnd: end,
+    source,
+    note,
+  };
+}
+
+// ================= 公开接口（访客，无需口令） =================
+// 只暴露最新已发布版本的不可变快照，不触碰草稿。
+
+router.get('/api/public/chronicle', (req, res) => {
+  const no = latestVersionNo();
+  if (no === 0) {
+    return res.json({ published: false, message: '年表尚未发布任何版本' });
+  }
+  // 访客视图：命中已登记出处的位置统一显示「出处已遮盖」，其余字段与版本号不变
+  const version = applyRedactionToVersion(getVersionDetail(no));
+  res.json({ published: true, currentVersionNo: no, version });
+});
+
+router.get('/api/public/versions', (req, res) => {
+  const no = latestVersionNo();
+  const rows = getDb()
+    .prepare(
+      `SELECT version_no AS versionNo, parent_no AS parentNo, editor, note, published_at AS publishedAt
+         FROM versions ORDER BY version_no DESC`
+    )
+    .all();
+  res.json({ currentVersionNo: no, versions: rows });
+});
+
+router.get('/api/public/versions/:no', (req, res) => {
+  const no = Number(req.params.no);
+  const detail = getVersionDetail(no);
+  if (!detail) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
+  // 访客读取指定历史版本同样应用出处遮盖
+  res.json({ version: applyRedactionToVersion(detail) });
+});
+
+// ================= 编辑者接口 =================
+
+// 草稿全貌：事件、主张、关系 + 当前最新版本号
+router.get('/api/editor/state', (req, res) => {
+  const db = getDb();
+  const events = db.prepare('SELECT * FROM events ORDER BY id').all().map(eventRowToApi);
+  const relations = db
+    .prepare('SELECT * FROM relations ORDER BY id')
+    .all()
+    .map((r) => ({
+      id: r.id,
+      earlierId: r.earlier_id,
+      laterId: r.later_id,
+      source: r.source,
+      note: r.note,
+    }));
+  res.json({
+    currentVersionNo: latestVersionNo(),
+    currentVersion: getVersionSummary(latestVersionNo()) || null,
+    draftRevisionNo: draftRevisionNo(),
+    events,
+    relations,
+  });
+});
+
+// ---- 事件 CRUD ----
+router.post('/api/editor/events', (req, res) => {
+  const title = requireString(req.body, 'title', { max: 200 });
+  const description = optionalString(req.body, 'description', 5000);
+  const info = getDb().prepare('INSERT INTO events (title, description) VALUES (?, ?)').run(title.trim(), description);
+  res.status(201).json({ event: eventRowToApi(getEventOr404(info.lastInsertRowid)) });
+});
+
+router.put('/api/editor/events/:id', (req, res) => {
+  const id = Number(req.params.id);
+  getEventOr404(id);
+  const title = requireString(req.body, 'title', { max: 200 });
+  const description = optionalString(req.body, 'description', 5000);
+  getDb()
+    .prepare('UPDATE events SET title = ?, description = ?, updated_at = datetime(\'now\') WHERE id = ?')
+    .run(title.trim(), description, id);
+  res.json({ event: eventRowToApi(getEventOr404(id)) });
+});
+
+router.delete('/api/editor/events/:id', (req, res) => {
+  const id = Number(req.params.id);
+  getEventOr404(id);
+  getDb().prepare('DELETE FROM events WHERE id = ?').run(id);
+  res.json({ deleted: id });
+});
+
+// ---- 主张 CRUD（同一事件允许矛盾主张并存） ----
+router.post('/api/editor/events/:id/claims', (req, res) => {
+  const eventId = Number(req.params.id);
+  getEventOr404(eventId);
+  const p = readClaimPayload(req.body);
+  const info = getDb()
+    .prepare(
+      `INSERT INTO claims
+         (event_id, precision, year, month, day, date_label, interval_start, interval_end, source, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(eventId, p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note);
+  res.status(201).json({ claim: claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(info.lastInsertRowid)) });
+});
+
+router.put('/api/editor/claims/:claimId', (req, res) => {
+  const claimId = Number(req.params.claimId);
+  const existing = getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
+  if (!existing) throw { status: 404, message: `主张 ${claimId} 不存在` };
+  const p = readClaimPayload(req.body);
+  getDb()
+    .prepare(
+      `UPDATE claims SET precision=?, year=?, month=?, day=?, date_label=?,
+         interval_start=?, interval_end=?, source=?, note=? WHERE id=?`
+    )
+    .run(p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note, claimId);
+  res.json({ claim: claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId)) });
+});
+
+router.delete('/api/editor/claims/:claimId', (req, res) => {
+  const claimId = Number(req.params.claimId);
+  const existing = getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
+  if (!existing) throw { status: 404, message: `主张 ${claimId} 不存在` };
+  getDb().prepare('DELETE FROM claims WHERE id = ?').run(claimId);
+  res.json({ deleted: claimId });
+});
+
+// ---- 关系 CRUD ----
+router.post('/api/editor/relations', (req, res) => {
+  const earlierId = Number(req.body.earlierId);
+  const laterId = Number(req.body.laterId);
+  if (!Number.isInteger(earlierId) || !Number.isInteger(laterId)) {
+    throw badRequest('earlierId 与 laterId 必须是事件 id 整数');
+  }
+  if (earlierId === laterId) throw badRequest('一个事件不能先于自身');
+  getEventOr404(earlierId);
+  getEventOr404(laterId);
+  const source = optionalString(req.body, 'source', 1000);
+  const note = optionalString(req.body, 'note', 2000);
+  const info = getDb()
+    .prepare('INSERT INTO relations (earlier_id, later_id, source, note) VALUES (?, ?, ?, ?)')
+    .run(earlierId, laterId, source, note);
+  const row = getDb().prepare('SELECT * FROM relations WHERE id = ?').get(info.lastInsertRowid);
+  res.status(201).json({
+    relation: { id: row.id, earlierId: row.earlier_id, laterId: row.later_id, source: row.source, note: row.note },
+  });
+});
+
+router.delete('/api/editor/relations/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const row = getDb().prepare('SELECT * FROM relations WHERE id = ?').get(id);
+  if (!row) throw { status: 404, message: `关系 ${id} 不存在` };
+  getDb().prepare('DELETE FROM relations WHERE id = ?').run(id);
+  res.json({ deleted: id });
+});
+
+// ---- 发布前预检：不落库，返回求解错误或可行日期 ----
+router.post('/api/editor/validate', (req, res) => {
+  const selectionList = normalizeSelection(req.body);
+  const result = evaluateDraft(selectionList);
+  if (!result.ok) {
+    return res.json({ ok: false, errors: result.errors });
+  }
+  const { dates, events, selected } = result;
+  const preview = events
+    .map((ev) => {
+      const sel = selected.get(ev.id);
+      return {
+        eventId: ev.id,
+        title: ev.title,
+        claimId: sel.claimId,
+        resolvedDate: iso(dates.get(ev.id)),
+        intervalStart: iso(sel.startOrd),
+        intervalEnd: iso(sel.endOrd),
+      };
+    })
+    .sort((a, b) => a.resolvedDate.localeCompare(b.resolvedDate));
+  res.json({ ok: true, preview });
+});
+
+function iso(ord) {
+  // 延迟 require 避免循环
+  return require('./dates').isoFromOrdinal(ord);
+}
+
+function normalizeSelection(body) {
+  const raw = body && body.selection;
+  if (!Array.isArray(raw)) throw badRequest('selection 必须是 [{eventId, claimId}] 数组');
+  return raw.map((item) => {
+    const eventId = Number(item && item.eventId);
+    const claimId = Number(item && item.claimId);
+    if (!Number.isInteger(eventId) || !Number.isInteger(claimId)) {
+      throw badRequest('selection 中每项必须包含整数 eventId 与 claimId');
+    }
+    return { eventId, claimId };
+  });
+}
+
+// ---- 正式发布：创建不可变版本 ----
+router.post('/api/editor/publish', (req, res) => {
+  const selectionList = normalizeSelection(req.body);
+  const baseVersionNo = req.body.baseVersionNo === null || req.body.baseVersionNo === undefined
+    ? null
+    : Number(req.body.baseVersionNo);
+  if (baseVersionNo !== null && !Number.isInteger(baseVersionNo)) {
+    throw badRequest('baseVersionNo 必须是整数或 null');
+  }
+  const editor = optionalString(req.body, 'editor', 200) || '匿名编辑';
+  const note = optionalString(req.body, 'note', 1000);
+  const result = publishVersion({ selectionList, baseVersionNo, editor, note });
+  res.status(201).json({ ok: true, ...result });
+});
+
+// 版本列表（编辑者视角，结构与公开一致）
+router.get('/api/editor/versions', (req, res) => {
+  const no = latestVersionNo();
+  const rows = getDb()
+    .prepare(
+      `SELECT version_no AS versionNo, parent_no AS parentNo, editor, note, published_at AS publishedAt
+         FROM versions ORDER BY version_no DESC`
+    )
+    .all();
+  res.json({ currentVersionNo: no, versions: rows });
+});
+
+// ---- 从已发布版本恢复草稿：只读预览，不改数据 ----
+// 列出该版事件、被选时间主张、先于关系，以及当前草稿将被替换的内容。
+router.get('/api/editor/restore-preview/:no', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('版本号必须是正整数');
+  const preview = buildRestorePreview(no);
+  if (!preview) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
+  res.json({ ok: true, ...preview });
+});
+
+// ---- 确认恢复：原子替换整个草稿 ----
+// 必须提交预览时的草稿修订号 draftRevisionNo 与最新版本号 currentVersionNo。
+router.post('/api/editor/restore', (req, res) => {
+  const versionNo = Number(req.body && req.body.versionNo);
+  if (!Number.isInteger(versionNo) || versionNo < 1) {
+    throw badRequest('versionNo 必须是正整数');
+  }
+  const expectedRevision = Number(req.body && req.body.draftRevisionNo);
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+    throw badRequest('draftRevisionNo 必须是非负整数（取预览时返回的值）');
+  }
+  const expectedLatestVersionNo = Number(req.body && req.body.currentVersionNo);
+  if (!Number.isInteger(expectedLatestVersionNo) || expectedLatestVersionNo < 0) {
+    throw badRequest('currentVersionNo 必须是非负整数（取预览时返回的值）');
+  }
+  const result = restoreDraftFromVersion({ versionNo, expectedRevision, expectedLatestVersionNo });
+  res.status(200).json({ ok: true, ...result });
+});
+
+// ---- 导入采访整理包：只读预览，不改数据 ----
+// 请求体即整理包 JSON。校验问题（键重复 / 引用缺失 / 日期或出处非法等）一次性列出，
+// 有任何问题即 422 整包拒绝；通过时返回待写入内容、数量、内容指纹与草稿修订号。
+router.post('/api/editor/import-preview', (req, res) => {
+  const preview = buildImportPreview(req.body);
+  res.json({ ok: true, ...preview });
+});
+
+// ---- 确认导入：一个事务追加整包 ----
+// 必须提交原包 bundle、预览返回的内容指纹 fingerprint 与草稿修订号 draftRevisionNo。
+router.post('/api/editor/import', (req, res) => {
+  const body = req.body || {};
+  if (!body.bundle || typeof body.bundle !== 'object' || Array.isArray(body.bundle)) {
+    throw badRequest('bundle 必须是整理包对象（与预览时提交的完全一致）');
+  }
+  const fingerprint = body.fingerprint;
+  if (typeof fingerprint !== 'string' || fingerprint.trim() === '') {
+    throw badRequest('fingerprint 必须是预览返回的内容指纹字符串');
+  }
+  const expectedRevision = Number(body.draftRevisionNo);
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+    throw badRequest('draftRevisionNo 必须是非负整数（取预览时返回的值）');
+  }
+  const result = confirmImport({ bundle: body.bundle, fingerprint: fingerprint.trim(), expectedRevision });
+  res.status(201).json({ ok: true, ...result });
+});
+
+// ---- 已发布版本原文（持编辑口令）：不应用出处遮盖 ----
+// 访客公开接口中命中遮盖登记的 source 显示「出处已遮盖」；
+// 编辑者持口令通过本接口仍可查看快照原文（恢复草稿亦使用原文，不受影响）。
+router.get('/api/editor/versions/:no/raw', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('版本号必须是正整数');
+  const detail = getVersionDetail(no);
+  if (!detail) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
+  res.json({ version: detail });
+});
+
+// ---- 按出处原文撤回公开展示：只读预览，不改数据 ----
+// 体含 source（非空精确出处文本）。返回它在全部已发布版本的事件主张与
+// 「先于」关系中命中的位置与数量、当前最新版本号；另附草稿区命中供编辑参考
+// （草稿命中位置在以后发布时自动遮盖）。
+router.post('/api/editor/redaction-preview', (req, res) => {
+  const source = req.body && req.body.source;
+  res.json(previewSourceRedaction(source));
+});
+
+// ---- 确认遮盖：登记精确出处文本（只追加，不改快照/草稿） ----
+// 必须提交预览时返回的 currentVersionNo；预览后若有新版本 → 409 不落库；
+// 文本已登记过 → 幂等返回已遮盖状态（alreadyRedacted: true）。
+router.post('/api/editor/redaction', (req, res) => {
+  const body = req.body || {};
+  const result = confirmSourceRedaction({
+    source: body.source,
+    expectedLatestVersionNo: body.currentVersionNo,
+    editor: optionalString(body, 'editor', 200),
+  });
+  res.json(result);
+});
+
+// 已登记的出处遮盖清单（编辑者视角，含原文）
+router.get('/api/editor/redactions', (req, res) => {
+  res.json({ currentVersionNo: latestVersionNo(), redactions: listRedactions() });
+});
+
+module.exports = router;

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>地方口述史事件年表</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>地方口述史事件年表</h1>
+    <span class="sub" id="versionTag">加载中…</span>
+    <span class="spacer"></span>
+    <a class="muted" href="/editor">编辑者入口</a>
+  </header>
+
+  <main class="container">
+    <div id="message"></div>
+    <div id="chronicle" class="grid2" style="display:none">
+      <section>
+        <div class="card">
+          <h2>年表（按发布时确定的先后排列）</h2>
+          <p class="muted" id="caveat"></p>
+          <div class="timeline" id="timeline"></div>
+        </div>
+      </section>
+      <section>
+        <div class="card">
+          <h2>事件间「先于」关系</h2>
+          <div id="relations"></div>
+        </div>
+        <div class="card">
+          <h2>关于日期</h2>
+          <p class="muted">
+            年、月精度的主张表示一段覆盖区间（如「1958 年」覆盖 1958-01-01 至 1958-12-31）。
+            发布时编辑者为每个事件选定一条主张，系统在区间内确定一个具体日期，
+            使全部「先于」关系成立。下列日期为系统确定的具体日期，原始主张精度与出处随事件标注。
+          </p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/visitor.js"></script>
+</body>
+</html>
