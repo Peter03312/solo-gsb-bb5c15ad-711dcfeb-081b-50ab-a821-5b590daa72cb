@@ -12,6 +12,13 @@ const {
   applyRedactionToVersion,
   listRedactions,
 } = require('./redact');
+const {
+  createSchedule,
+  getSchedule,
+  listSchedules,
+  cancelSchedule,
+} = require('./schedule');
+const scheduler = require('./scheduler');
 
 const router = express.Router();
 
@@ -400,6 +407,55 @@ router.post('/api/editor/redaction', (req, res) => {
 // 已登记的出处遮盖清单（编辑者视角，含原文）
 router.get('/api/editor/redactions', (req, res) => {
   res.json({ currentVersionNo: latestVersionNo(), redactions: listRedactions() });
+});
+
+// ---- 预约发布：建立预约（冻结事件/所选主张/先于关系/求解日期/当前最新版本号） ----
+// 体含 selection、scheduledAt（未来 UTC 时刻）、baseVersionNo、editor、note。
+// 时间非法或非未来 → 400；选择为空 → 400；草稿未通过现有发布校验 → 422；
+// baseVersionNo 不等于当前最新版本号 → 409；均不建立预约。
+router.post('/api/editor/schedules', (req, res) => {
+  const body = req.body || {};
+  const selectionList = normalizeSelection(body);
+  const baseVersionNo = body.baseVersionNo === null || body.baseVersionNo === undefined
+    ? null
+    : Number(body.baseVersionNo);
+  if (baseVersionNo !== null && !Number.isInteger(baseVersionNo)) {
+    throw badRequest('baseVersionNo 必须是整数或 null');
+  }
+  const editor = optionalString(body, 'editor', 200) || '匿名编辑';
+  const note = optionalString(body, 'note', 1000);
+  const schedule = createSchedule({
+    selectionList,
+    scheduledAtRaw: body.scheduledAt,
+    baseVersionNo,
+    editor,
+    note,
+  });
+  // 新建后立即唤醒调度器（通常 1 秒内也会自然触发）
+  scheduler.kick();
+  res.status(201).json({ ok: true, schedule });
+});
+
+// 预约列表（工作台）：未执行的在前；列表项含冻结事件摘要
+router.get('/api/editor/schedules', (req, res) => {
+  res.json({ currentVersionNo: latestVersionNo(), schedules: listSchedules() });
+});
+
+// 预约详情：展开冻结的完整事件 / 主张 / 关系 / 求解日期（冲突后供编辑者查看内容）
+router.get('/api/editor/schedules/:no', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('预约号必须是正整数');
+  const schedule = getSchedule(no);
+  if (!schedule) throw { status: 404, message: `预约 ${req.params.no} 不存在` };
+  res.json({ schedule });
+});
+
+// 取消尚未执行的预约；已生效（published/conflict）的预约不能取消（409）
+router.delete('/api/editor/schedules/:no', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('预约号必须是正整数');
+  const result = cancelSchedule(no);
+  res.json({ ok: true, ...result });
 });
 
 module.exports = router;

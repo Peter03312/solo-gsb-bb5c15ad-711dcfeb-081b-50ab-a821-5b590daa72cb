@@ -35,6 +35,7 @@ let restorePreview = null; // 恢复草稿预览（确认时提交其中的修�
 let bundleParsed = null;   // 解析后的整理包原包（确认时原样提交）
 let bundlePreview = null;  // 导入预览（确认时提交其中的指纹/草稿修订号）
 let redactPreview = null;  // 出处遮盖预览（确认时提交其中的最新版本号）
+let scheduleDetail = null; // 当前打开的预约详情
 
 async function api(method, url, body) {
   const res = await fetch(url, {
@@ -191,6 +192,7 @@ async function loadState() {
   if (changed) localStorage.setItem('selections', JSON.stringify(m));
   render();
   loadVersions();
+  loadSchedules();
 }
 
 async function loadVersions() {
@@ -679,6 +681,200 @@ async function openRawVersion(versionNo) {
   }
 }
 
+// ---------- 预约发布 ----------
+function showScheduleResult(kind, html) {
+  $('#scheduleResult').innerHTML = `<div class="alert ${kind}">${html}</div>`;
+}
+
+function utcIsoFromMs(ms) {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+const SCHEDULE_STATUS_LABEL = {
+  pending: '待执行',
+  published: '已发布',
+  conflict: '冲突未发布',
+  cancelled: '已取消',
+};
+
+async function loadSchedules() {
+  try {
+    const data = await api('GET', '/api/editor/schedules');
+    renderScheduleList(data.schedules);
+  } catch (err) {
+    if (err.message !== 'unauthorized') $('#scheduleList').innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+  }
+}
+
+function renderScheduleList(schedules) {
+  if (!schedules.length) {
+    $('#scheduleList').innerHTML = '<p class="muted">尚无预约。</p>';
+    return;
+  }
+  const nowMs = Date.now();
+  $('#scheduleList').innerHTML = schedules.map((s) => {
+    const dueMs = Date.parse(s.scheduledAt);
+    const countdown = s.status === 'pending'
+      ? `<span class="muted">（${esc(describeDelta(dueMs - nowMs))}后执行）</span>`
+      : '';
+    const statusBadge = s.status === 'conflict'
+      ? '<span class="badge" style="background:#fbeaea;color:#a33">冲突未发布</span>'
+      : `<span class="badge">${esc(SCHEDULE_STATUS_LABEL[s.status] || s.status)}</span>`;
+    const action = s.status === 'pending'
+      ? `<button class="danger" type="button" data-cancel-schedule="${s.scheduleNo}" style="padding:2px 10px;font-size:13px">取消预约</button>`
+      : '';
+    return `
+      <div class="rel-line">
+        <div class="row" style="align-items:center">
+          <strong>预约 #${s.scheduleNo}</strong>
+          ${statusBadge}
+          <span class="muted" style="flex:1">${esc(s.scheduledAt)} ${countdown} · ${esc(s.editor || '匿名')} ·
+            冻结于第 ${s.baseVersionNo} 版 · ${s.eventCount} 事件 / ${s.relationCount} 关系</span>
+          <button class="secondary" type="button" data-view-schedule="${s.scheduleNo}" style="padding:2px 10px;font-size:13px">查看冻结内容</button>
+          ${action}
+        </div>
+        ${s.note ? `<div class="muted">说明：${esc(s.note)}</div>` : ''}
+        ${s.status === 'published'
+          ? `<div class="muted">已于 ${esc(s.attemptedAt || '')} UTC 生成 <b>第 ${s.resultVersionNo} 版</b>。</div>` : ''}
+        ${s.status === 'conflict'
+          ? `<div class="muted" style="color:#a33">${esc(s.resultMessage)}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+function describeDelta(ms) {
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec} 秒`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min} 分钟`;
+  const hr = Math.round(min / 60);
+  return `${hr} 小时`;
+}
+
+async function doCreateSchedule() {
+  const err = clientCheck();
+  if (err) { showScheduleResult('error', esc(err)); return; }
+  const scheduledAt = $('#scheduleAt').value.trim();
+  if (!scheduledAt) { showScheduleResult('error', '请填写预约发布的未来 UTC 时刻（形如 2026-10-02T12:34:00Z）。'); return; }
+  const btn = $('#btnSchedule');
+  btn.disabled = true;
+  try {
+    const data = await api('POST', '/api/editor/schedules', {
+      selection: gatherSelection(),
+      scheduledAt,
+      baseVersionNo,
+      editor: store.editor || '匿名编辑',
+      note: $('#publishNote').value,
+    });
+    showScheduleResult('ok',
+      `已建立 <b>预约 #${data.schedule.scheduleNo}</b>：将在 <b>${esc(data.schedule.scheduledAt)}</b> 尝试发布。
+       事件、所选主张、关系、求解日期与基准版本号（第 ${data.schedule.baseVersionNo} 版）已冻结；
+       到期前访客仍只见当前最新版，之后修改草稿不影响本预约。`);
+    $('#scheduleAt').value = '';
+    await loadSchedules();
+  } catch (e) {
+    if (e.status === 422 && e.body?.errors) {
+      showScheduleResult('error',
+        `<b>草稿未通过发布校验，未建立预约。</b><ul class="error-list">${
+          e.body.errors.map((er) => `<li><b>${esc(er.message)}</b></li>`).join('')
+        }</ul>`);
+    } else if (e.status === 409) {
+      showScheduleResult('error', esc(e.message) + ' 未建立任何预约。');
+      conflictData = e.body;
+      showConflictDialog(e.body);
+    } else {
+      showScheduleResult('error', esc(e.message));
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function openScheduleDetail(no) {
+  $('#scheduleDetailNo').textContent = '#' + no;
+  $('#scheduleBody').textContent = '加载中…';
+  $('#scheduleCancelDlg').disabled = false;
+  $('#scheduleDialog').showModal();
+  scheduleDetail = null;
+  try {
+    const data = await api('GET', `/api/editor/schedules/${no}`);
+    scheduleDetail = data.schedule;
+    renderScheduleDetail(data.schedule);
+  } catch (err) {
+    if (err.message === 'unauthorized') { $('#scheduleDialog').close(); return; }
+    $('#scheduleBody').innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+    $('#scheduleCancelDlg').disabled = true;
+  }
+}
+
+function renderScheduleDetail(s) {
+  const evs = s.frozen.events.map((e) => `
+    <div class="rel-line">
+      <strong>${esc(e.title)}</strong>
+      <span class="badge prec">${esc(e.dateLabel)}</span>
+      <span class="badge">求解日期 ${esc(e.resolvedDate)}</span>
+      <span class="muted">区间 ${esc(e.intervalStart)} ~ ${esc(e.intervalEnd)}</span>
+      <div class="source"><b>出处：</b>${esc(e.source || '（未注明）')}</div>
+      ${e.claimNote ? `<div class="muted">${esc(e.claimNote)}</div>` : ''}
+    </div>`).join('');
+  const titleById = new Map(s.frozen.events.map((e) => [e.eventId, e.title]));
+  const rels = s.frozen.relations.length
+    ? s.frozen.relations.map((r) => `
+      <div class="rel-line">
+        <strong>${esc(titleById.get(r.earlierEventId) || '#' + r.earlierEventId)}</strong>
+        <span class="badge">先于</span>
+        <strong>${esc(titleById.get(r.laterEventId) || '#' + r.laterEventId)}</strong>
+        ${r.source ? `<div class="source"><b>出处：</b>${esc(r.source)}</div>` : ''}
+      </div>`).join('')
+    : '<p class="muted">（无先于关系）</p>';
+
+  const statusLine = {
+    pending: `<p>状态：<b>待执行</b>，将于 <b>${esc(s.scheduledAt)}</b> 尝试发布。到期前可取消。</p>`,
+    published: `<p>状态：<b>已发布</b>，${esc(s.attemptedAt || '')} UTC 生成 <b>第 ${s.resultVersionNo} 版</b>，不可取消。</p>`,
+    conflict: `<p>状态：<b style="color:#a33">冲突未发布</b>。${esc(s.resultMessage)}<br>
+      <span class="muted">冻结内容完整保留如下，可重新核对草稿后即时发布或另建预约。</span></p>`,
+    cancelled: '<p>状态：<b>已取消</b>，不会发布。</p>',
+  }[s.status];
+
+  $('#scheduleBody').innerHTML = `
+    ${statusLine}
+    <p class="muted">冻结时基准版本号：第 ${s.baseVersionNo} 版 · 草稿修订号 ${s.draftRevisionNo} ·
+      建立于 ${esc(s.createdAt)} UTC · 编辑者：${esc(s.editor || '匿名')}${s.note ? ' · 说明：' + esc(s.note) : ''}</p>
+    <h3 style="font-size:13px">冻结的事件与被选主张（${s.eventCount}）</h3>
+    ${evs}
+    <h3 style="font-size:13px;margin-top:10px">冻结的「先于」关系（${s.relationCount}）</h3>
+    ${rels}
+    <div id="scheduleDlgMsg"></div>`;
+  $('#scheduleCancelDlg').style.display = s.status === 'pending' ? '' : 'none';
+}
+
+async function cancelScheduleFromDialog() {
+  if (!scheduleDetail) return;
+  const btn = $('#scheduleCancelDlg');
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/api/editor/schedules/${scheduleDetail.scheduleNo}`);
+    $('#scheduleDialog').close();
+    showScheduleResult('ok', `预约 #${scheduleDetail.scheduleNo} 已取消，不会发布。`);
+    await loadSchedules();
+  } catch (err) {
+    if (err.message === 'unauthorized') { $('#scheduleDialog').close(); return; }
+    $('#scheduleDlgMsg').innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+    btn.disabled = false;
+  }
+}
+
+async function cancelScheduleInline(no) {
+  if (!confirm(`确定取消预约 #${no}？取消后该预约不会发布。`)) return;
+  try {
+    await api('DELETE', `/api/editor/schedules/${no}`);
+    await loadSchedules();
+    showScheduleResult('ok', `预约 #${no} 已取消。`);
+  } catch (err) {
+    if (err.message !== 'unauthorized') showScheduleResult('error', esc(err.message));
+  }
+}
+
 // ---------- 事件委托：增删改 ----------
 async function onClick(e) {
   const t = e.target;
@@ -692,6 +888,17 @@ async function onClick(e) {
   }
   if (t.id === 'btnValidate') return doValidate();
   if (t.id === 'btnPublish') return doPublish();
+  if (t.id === 'btnSchedule') return doCreateSchedule();
+  if (t.id === 'btnScheduleNow1m') {
+    $('#scheduleAt').value = utcIsoFromMs(Date.now() + 60 * 1000);
+    return;
+  }
+  const viewSchedule = t.dataset && t.dataset.viewSchedule;
+  if (viewSchedule !== undefined) return openScheduleDetail(Number(viewSchedule));
+  const cancelSch = t.dataset && t.dataset.cancelSchedule;
+  if (cancelSch !== undefined) return cancelScheduleInline(Number(cancelSch));
+  if (t.id === 'scheduleCancelDlg') return cancelScheduleFromDialog();
+  if (t.id === 'scheduleClose') { $('#scheduleDialog').close(); scheduleDetail = null; return; }
 
   if (t.id === 'conflictCancel') { $('#conflictDialog').close(); return; }
   if (t.id === 'conflictReload') {
@@ -838,4 +1045,8 @@ $('#bundleFile').addEventListener('change', async (e) => {
   } catch (err) {
     if (err.message !== 'unauthorized') showGlobal('error', esc(err.message));
   }
+  // 预约列表每 5 秒轻量刷新一次（状态/倒计时；不打扰草稿编辑）
+  setInterval(() => {
+    if (store.token && !document.hidden) loadSchedules();
+  }, 5000);
 })();

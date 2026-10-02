@@ -4,6 +4,7 @@ const path = require('path');
 const express = require('express');
 const { getDb } = require('./db');
 const routes = require('./routes');
+const scheduler = require('./scheduler');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -50,6 +51,8 @@ function start() {
   getDb(); // 初始化数据库
   const port = Number(process.env.PORT || 3000);
   const host = process.env.HOST || '0.0.0.0';
+  // 启动预约发布调度器：立即补跑停机期间到期的预约，之后每秒检查一次
+  scheduler.start();
   const server = app.listen(port, host, () => {
     console.log(`地方口述史年表已启动`);
     console.log(`  访客年表:  http://localhost:${port}/`);
@@ -63,4 +66,4 @@ if (require.main === module) {
   start();
 }
 
-module.exports = { app, start, EDITOR_TOKEN };
+module.exports = { app, start, EDITOR_TOKEN, scheduler };

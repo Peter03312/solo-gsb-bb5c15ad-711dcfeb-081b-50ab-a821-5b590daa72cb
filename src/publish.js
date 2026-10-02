@@ -46,6 +46,99 @@ function evaluateDraft(selectionList) {
   return { ...result, events, claims, relations, selected };
 }
 
+// 由求解结果构造可直接入库 / 冻结的快照数据（不写库）。
+// 立即发布与预约发布共用本函数，保证两条路径写出的快照语义完全一致。
+// 返回 { eventRows, relationRows }，eventRows 已按求解日期升序（sort_order 即数组下标）。
+function buildFrozenSnapshot(evalResult) {
+  const { dates, events, selected, relations, claims } = evalResult;
+
+  const sorted = [...events].sort((a, b) => {
+    const da = dates.get(a.id);
+    const db2 = dates.get(b.id);
+    if (da !== db2) return da - db2;
+    return a.title.localeCompare(b.title, 'zh-Hans-CN');
+  });
+
+  const eventRows = sorted.map((ev, i) => {
+    const sel = selected.get(ev.id);
+    const claimRow = claims.find((c) => c.id === sel.claimId);
+    return {
+      eventId: ev.id,
+      title: ev.title,
+      description: ev.description || '',
+      claimId: claimRow.id,
+      precision: claimRow.precision,
+      dateLabel: claimRow.date_label,
+      intervalStart: claimRow.interval_start,
+      intervalEnd: claimRow.interval_end,
+      resolvedDate: isoFromOrdinal(dates.get(ev.id)),
+      source: claimRow.source,
+      claimNote: claimRow.note || '',
+      sortOrder: i,
+    };
+  });
+
+  const eventOrder = new Map(sorted.map((ev, i) => [ev.id, i]));
+  const sortedRels = [...relations].sort(
+    (a, b) =>
+      eventOrder.get(a.earlierId) - eventOrder.get(b.earlierId) ||
+      eventOrder.get(a.laterId) - eventOrder.get(b.laterId)
+  );
+  const relationRows = sortedRels.map((r, i) => ({
+    relationId: r.id,
+    earlierEventId: r.earlierId,
+    laterEventId: r.laterId,
+    source: r.source || '',
+    note: r.note || '',
+    sortOrder: i,
+  }));
+
+  return { eventRows, relationRows };
+}
+
+// 在调用方事务内，把冻结快照写成版本号 newNo 的不可变版本。
+// 调用方须自行做基准版本号冲突检查并预先确定 newNo。
+function insertVersionFromSnapshot({ db, newNo, parentNo, editor, note, snapshot }) {
+  const verInfo = db
+    .prepare('INSERT INTO versions (version_no, parent_no, editor, note) VALUES (?, ?, ?, ?)')
+    .run(newNo, parentNo, String(editor || ''), String(note || ''));
+  const versionId = verInfo.lastInsertRowid;
+
+  const insEvent = db.prepare(`
+    INSERT INTO version_events
+      (version_id, event_id, title, description, claim_id, precision, date_label,
+       interval_start, interval_end, resolved_date, source, claim_note, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const e of snapshot.eventRows) {
+    insEvent.run(
+      versionId,
+      e.eventId,
+      e.title,
+      e.description,
+      e.claimId,
+      e.precision,
+      e.dateLabel,
+      e.intervalStart,
+      e.intervalEnd,
+      e.resolvedDate,
+      e.source,
+      e.claimNote,
+      e.sortOrder
+    );
+  }
+
+  const insRel = db.prepare(`
+    INSERT INTO version_relations
+      (version_id, relation_id, earlier_event_id, later_event_id, source, note, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const r of snapshot.relationRows) {
+    insRel.run(versionId, r.relationId, r.earlierEventId, r.laterEventId, r.source, r.note, r.sortOrder);
+  }
+  return versionId;
+}
+
 // 发布一个新版本。selectionList: [{eventId, claimId}]
 // baseVersionNo: 编辑者发起修改时所基于的版本号；null/0 表示尚无版本。
 // 抛 { status, ...body } 表示 HTTP 错误。
@@ -56,8 +149,6 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
     throw { status: 400, message: '请为每个事件选择一条主张后再发布' };
   }
 
-  const currentRow = db.prepare('SELECT MAX(version_no) AS no FROM versions').get();
-  const currentNo = currentRow.no || 0;
   const base = Number(baseVersionNo || 0);
 
   const evalResult = evaluateDraft(selectionList);
@@ -68,6 +159,7 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
       errors: evalResult.errors,
     };
   }
+  const snapshot = buildFrozenSnapshot(evalResult);
 
   // 在事务内再次确认基准版本，避免并发下的静默覆盖
   const tx = db.transaction(() => {
@@ -85,64 +177,7 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
     }
 
     const newNo = latest + 1;
-    const verInfo = db
-      .prepare('INSERT INTO versions (version_no, parent_no, editor, note) VALUES (?, ?, ?, ?)')
-      .run(newNo, base, String(editor || ''), String(note || ''));
-    const versionId = verInfo.lastInsertRowid;
-
-    const { dates, events, selected, relations } = evalResult;
-
-    const insEvent = db.prepare(`
-      INSERT INTO version_events
-        (version_id, event_id, title, description, claim_id, precision, date_label,
-         interval_start, interval_end, resolved_date, source, claim_note, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    // 年表按求解出的具体日排序；同日按标题，保持稳定
-    const sorted = [...events].sort((a, b) => {
-      const da = dates.get(a.id);
-      const db2 = dates.get(b.id);
-      if (da !== db2) return da - db2;
-      return a.title.localeCompare(b.title, 'zh-Hans-CN');
-    });
-
-    const eventOrder = new Map();
-    sorted.forEach((ev, i) => {
-      eventOrder.set(ev.id, i);
-      const sel = selected.get(ev.id);
-      const claimRow = evalResult.claims.find((c) => c.id === sel.claimId);
-      insEvent.run(
-        versionId,
-        ev.id,
-        ev.title,
-        ev.description,
-        claimRow.id,
-        claimRow.precision,
-        claimRow.date_label,
-        claimRow.interval_start,
-        claimRow.interval_end,
-        isoFromOrdinal(dates.get(ev.id)),
-        claimRow.source,
-        claimRow.note,
-        i
-      );
-    });
-
-    const insRel = db.prepare(`
-      INSERT INTO version_relations
-        (version_id, relation_id, earlier_event_id, later_event_id, source, note, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    const sortedRels = [...relations].sort(
-      (a, b) =>
-        eventOrder.get(a.earlierId) - eventOrder.get(b.earlierId) ||
-        eventOrder.get(a.laterId) - eventOrder.get(b.laterId)
-    );
-    sortedRels.forEach((r, i) => {
-      insRel.run(versionId, r.id, r.earlierId, r.laterId, r.source || '', r.note || '', i);
-    });
-
+    insertVersionFromSnapshot({ db, newNo, parentNo: base, editor, note, snapshot });
     return newNo;
   });
 
@@ -193,4 +228,12 @@ function getVersionDetail(no) {
   return { ...summary, events: listEvents, relations: listRels };
 }
 
-module.exports = { publishVersion, evaluateDraft, latestVersionNo, getVersionDetail, getVersionSummary };
+module.exports = {
+  publishVersion,
+  evaluateDraft,
+  buildFrozenSnapshot,
+  insertVersionFromSnapshot,
+  latestVersionNo,
+  getVersionDetail,
+  getVersionSummary,
+};

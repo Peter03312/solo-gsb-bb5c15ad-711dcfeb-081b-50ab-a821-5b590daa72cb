@@ -52,6 +52,7 @@ npm test                      # 运行求解器与接口测试
 | `EDITOR_TOKEN` | `editor` | 编辑者口令，生产使用务必修改 |
 | `DB_PATH` | `./data/chronicle.db`（容器内 `/app/data/chronicle.db`） | SQLite 数据库文件路径，目录自动创建 |
 | `SEED_DEMO` | 未设置 | 设为 `1` 时启动写入演示草稿（仅在库为空时） |
+| `SCHEDULE_TICK_MS` | `1000` | 预约发布到期检查间隔（毫秒）；每次服务启动都会立即补跑一次到期预约 |
 
 改端口示例：
 
@@ -68,7 +69,7 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 2. 在「事件与时间主张」中添加事件；每个事件可添加**任意多条**时间主张，每条必须填写出处（受访人 / 访谈时间 / 档案全宗 / 页码等），矛盾说法可用「考异备注」记录。
 3. 用单选按钮为**每个**事件选定一条拟发布主张（选择只保存在当前浏览器中）。
 4. 在「先于」关系中声明 A 严格先于 B，可附出处。
-5. 「校验能否发布」先预览；「发布新版本」正式生成不可变快照。
+5. 「校验能否发布」先预览；「发布新版本」正式生成不可变快照。也可以「预约发布」：指定一个**未来 UTC 时刻**，系统在到期时自动尝试发布（见下节）。
 
 ### 发布规则（为什么会发布失败）
 
@@ -85,6 +86,40 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 3. **时间无解**：区间内不存在满足全部严格先后关系的具体日期。错误信息会给出一条导致矛盾的见证链，例如「冬月会议 先于 春月会议」却分别主张 1958 年 12 月、1958 年 1 月。
 
 发布成功后得到递增版本号（第 1 版、第 2 版……），事件、所选主张（精度、区间、出处、考异）、关系与求解日期全部**复制进版本快照**；此后修改草稿不影响任何旧版本。访客页只展示当前最新版本。
+
+### 预约未来时刻（UTC）自动发布
+
+除即时发布外，编辑者可为**通过现有发布校验的草稿**选定每事件主张，并指定一个**未来 UTC 时间**预约发布：
+
+- **建立即冻结**：预约成功时，系统把当时的**事件、每事件所选主张、「先于」关系、求解日期**与**当前最新版本号（冻结基准版本号）**整体复制进预约。此后编辑者修改草稿、增删主张、从历史版本恢复草稿，**都不改变预约内容**；到期前访客仍只见当前最新版本。
+- **建立即校验**：时间必须是合法的未来 UTC 时刻（形如 `2026-10-02T12:34:00Z`，只接受 `Z` 结尾；秒可省略）。时间非法或已过期返回 **400**（`INVALID_SCHEDULED_TIME`）；主张选择为空 **400**；草稿不能通过现有发布校验（缺主张 / 成环 / 时间无解）返回 **422**（与即时发布同一错误结构）；`baseVersionNo` 不等于当前最新版本号返回 **409** `VERSION_CONFLICT`。**以上情况都不建立预约**。
+- **到期执行**：调度器在服务启动时立即补跑一次（停机期间到期的预约不丢失），之后每 1 秒检查一次（可用 `SCHEDULE_TICK_MS` 调整）。到期的待执行预约按**预约时间、预约号顺序**逐条处理：
+  - 仅当**冻结的基准版本号仍等于当前最新版本号**时，用冻结内容在一个事务内**生成一个不可变新版本**（写版本与翻转预约状态同事务，失败整体回滚，绝不留半版）；
+  - 否则把预约标记为 **冲突（conflict）**：**不发布、不自动改基准**，冻结的完整内容保留在预约详情中供编辑者查看，编辑者可核对后即时发布或另建预约。
+- **幂等与重启安全**：重启服务或重复触发都**不会重复发布**——只有 `pending`（待执行）状态的预约会被处理，已发布 / 冲突 / 已取消的预约永不再执行。
+- **查看与取消**：编辑者在工作台「发布」卡片中可查看全部预约（待执行的在前，显示倒计时、冻结基准版本号与冻结事件摘要）、展开冻结详情。**尚未执行的预约可随时取消**（取消幂等）；**已生效（已发布 / 冲突）的预约不能取消**（409 `SCHEDULE_NOT_CANCELLABLE`）。
+- 预约生成的新版本与即时发布完全同源（同一快照构造与求解逻辑），**公开读取继续应用出处遮盖**；即时发布、历史版本读取与原有接口保持兼容。
+
+```bash
+TOKEN=editor
+BASE=http://localhost:3000
+# 先用现有接口取草稿事件/主张，组装 selection（与即时发布相同）
+# 建立 5 分钟后到期的预约（时间必须是未来 UTC，Z 结尾）
+AT=$(node -e 'console.log(new Date(Date.now()+300000).toISOString().replace(/\.\d{3}Z$/,"Z"))')
+curl -s -X POST "$BASE/api/editor/schedules" \
+  -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"selection":[{"eventId":1,"claimId":1},{"eventId":2,"claimId":3}],
+       "scheduledAt":"'"$AT"'","baseVersionNo":2,
+       "editor":"志愿者小王","note":"纪念日后自动公开"}'
+# => 201 {"ok":true,"schedule":{"scheduleNo":1,"scheduledAt":"…Z","status":"pending",
+#        "baseVersionNo":2,"frozen":{"events":[…含求解日期…],"relations":[…]}, ...}}
+
+curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/schedules"           # 预约列表
+curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/schedules/1"         # 冻结内容详情
+curl -s -X DELETE -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/schedules/1"  # 到期前取消
+```
+
+到期后预约详情的 `status` 变为 `published`（附 `resultVersionNo`）或 `conflict`（附 `resultMessage`，冻结内容仍在 `frozen` 中）。完整可运行的端到端示例见 `examples/schedule-example.sh`（建预约、改草稿验证冻结、等待自动发布、抢先发布触发冲突、取消与各类 400/409/422，约 25 秒）。
 
 ### 从历史版本恢复草稿（预览 → 确认）
 
@@ -250,6 +285,7 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 - 历史版本表 `versions / version_events / version_relations` 只追加、不更新不删除，保证不可变。
 - 导入批次表 `import_batches` 记录每次成功导入的批次标识与内容指纹，用于防止同一批次重复导入。
 - 出处遮盖表 `source_redactions` 同样只追加：只存被遮盖的精确出处文本，**不回写快照或草稿**；删除该表对应行即恢复公开显示。
+- 预约发布表 `publish_schedules` 在建立时冻结完整待发布内容（事件 / 所选主张 / 关系 / 求解日期）与基准版本号；`status` 在待执行（`pending`）、已发布（`published`）、冲突（`conflict`）、已取消（`cancelled`）间单向流转。到期写版本与翻状态在同一事务内完成，重启只补跑 `pending` 行。
 
 ## 目录结构
 
@@ -264,10 +300,12 @@ src/
   restore.js    恢复草稿：只读预览 + 原子替换事务（修订号/版本号冲突检查、按快照重建）
   bundle.js     采访整理包导入：整包校验 + 内容指纹 + 只读预览 + 事务追加（批次防重/修订号冲突检查）
   redact.js     出处遮盖：精确出处文本的只读命中预览 + 只追加登记（版本号冲突检查）；公开读出层动态替换为「出处已遮盖」
+  schedule.js   预约发布：建立时冻结快照/基准版本号；到期按时间、预约号顺序逐条事务执行（发布或标冲突，幂等不重发不留半版）；查看/取消
+  scheduler.js  预约调度器：每秒检查到期预约，服务启动立即补跑（重启安全）
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-examples/       采访整理包 JSON 示例；出处遮盖 curl 调用示例
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖）
+examples/       采访整理包 JSON 示例；出处遮盖、预约发布 curl 调用示例
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑）
 ```
 
 ## 主要 HTTP API
@@ -303,4 +341,11 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
   - 200：`{alreadyRedacted:false, redactedLabel:"出处已遮盖", redactedAt, ...命中统计}`；重复确认 200 且 `alreadyRedacted:true`（不重复登记）
   - 409：`{code:"VERSION_CONFLICT", currentVersionNo, expectedVersionNo, ...}`（预览后发布了新版本，不落库）；空文本或版本号非法 400
 - `GET  /api/editor/redactions` — 已登记遮盖清单（编辑者视角，含出处原文与登记时间）
+- `POST /api/editor/schedules` — 建立预约发布；体含 `selection:[{eventId,claimId}]`、`scheduledAt`（未来 UTC，如 `2026-10-02T12:34:00Z`）、`baseVersionNo`、`editor`、`note`
+  - 201：`{schedule:{scheduleNo, scheduledAt, status:"pending", baseVersionNo, draftRevisionNo, eventCount, relationCount, frozen:{events:[…含 resolvedDate/source…], relations:[…]}, ...}}`（冻结快照）
+  - 400：时间非法 / 非未来时刻（`{code:"INVALID_SCHEDULED_TIME"}`）或选择为空；422：草稿未通过现有发布校验（`{errors:[...]}`，同即时发布）；409：`VERSION_CONFLICT`（基准版本号已过期）；均不建立预约
+- `GET  /api/editor/schedules` — 预约列表（待执行在前、按到期时刻升序；列表项含冻结事件摘要与执行结果）
+- `GET  /api/editor/schedules/:no` — 预约详情（展开冻结的完整事件 / 主张 / 关系 / 求解日期；不存在 404）
+- `DELETE /api/editor/schedules/:no` — 取消尚未执行的预约（200 `{cancelled:true}`；重复取消已取消的预约幂等 200 且 `alreadyCancelled:true`）
+  - 409：`{code:"SCHEDULE_NOT_CANCELLABLE", statusNow:"published"|"conflict", resultVersionNo}`（已生效不能取消）；不存在 404
 - `GET  /api/editor/versions/:no/raw` — 指定版本快照**原文**（持编辑口令，不应用遮盖；恢复草稿亦用原文）

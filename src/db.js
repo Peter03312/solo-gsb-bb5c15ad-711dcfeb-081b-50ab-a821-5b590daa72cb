@@ -140,6 +140,37 @@ CREATE TABLE IF NOT EXISTS source_redactions (
   editor      TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ============ 预约发布（编辑者指定未来 UTC 时间自动生成不可变版本） ============
+-- 建立预约时即把当时的草稿内容冻结进本行：事件、每事件所选主张、「先于」关系、
+-- 求解日期与当前最新版本号（base_version_no）。此后草稿的任何修改 / 恢复都与本预约无关。
+-- 到期由调度器按 (scheduled_at, id) 顺序在各自事务内处理：
+--   pending   —— 尚未执行；仅该状态可被编辑者取消；
+--   published —— 到期且冻结基准版本号仍等于当前最新版本号，已生成不可变新版本 result_version_no；
+--   conflict  —— 到期时基准版本号已落后（期间另有发布），不发布、不改基准，冻结内容保留供查看；
+--   cancelled —— 编辑者在到期前取消。
+-- 重启 / 重复触发只处理 pending 行；版本写入与状态翻转在同一事务内，杜绝重复发布与半版。
+CREATE TABLE IF NOT EXISTS publish_schedules (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,   -- 预约号
+  scheduled_at       TEXT NOT NULL,                       -- 到期 UTC 时刻（YYYY-MM-DDTHH:mm:ssZ，等宽可字典序比较）
+  status             TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','published','conflict','cancelled')),
+  base_version_no    INTEGER NOT NULL,                    -- 冻结的当前最新版本号（0 表示尚无版本）
+  draft_revision_no  INTEGER NOT NULL,                    -- 预约时草稿修订号（仅溯源）
+  selection_json     TEXT NOT NULL,                       -- 冻结：每事件所选主张 [{eventId,claimId}]
+  payload_json       TEXT NOT NULL,                       -- 冻结：完整待发布快照（事件/主张/关系/求解日期）
+  event_count        INTEGER NOT NULL,
+  relation_count     INTEGER NOT NULL,
+  editor             TEXT NOT NULL DEFAULT '',
+  note               TEXT NOT NULL DEFAULT '',
+  result_version_no  INTEGER,                             -- published：生成的新版本号
+  result_message     TEXT NOT NULL DEFAULT '',            -- conflict 等执行结果说明
+  created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  attempted_at       TEXT,                                -- 到期执行时刻（UTC ISO）
+  cancelled_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_due
+  ON publish_schedules(status, scheduled_at);
 `;
 
 let db;
